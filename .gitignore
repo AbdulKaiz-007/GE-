@@ -1,0 +1,92 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# build/debug logs
+*.log
+build_error*.txt
+build_output*.txt
+build_full.log
+build_log.txt
+build_results*.txt
+compact_errors.log
+error.log
+error_out.txt
+eslint_errors.json
+final_*.log
+full_lint_errors.log
+lint_*.txt
+local_build_debug.log
+nextjs.err.log
+nextjs.log
+results*.log
+results*.txt
+test_output.txt
+typescript_errors.log
+vercel_deploy.log
+final_lint_check.txt
+
+# temp test files
+test.jpg
+test.pdf
+test_*.mjs
+test_*.js
+test_*.py
+test_*.json
+test_*.out
+test_*.png
+
+# misc temp files
+api.txt
+models.json
+models.txt
+sample_notes.txt
+Bike_Sales_Dashboard_with_Sparklines.xlsx
+
+# scripts (temp)
+clean_underscores.js
+make_pdf.js
+set_rules_native.mjs
+
+# deploy scripts (keep if needed, remove if sensitive)
+*.ps1
+
+# capacitor / android
+/android/
+
+# docker (optional — remove if you want Docker in repo)
+# Dockerfile
+# docker-compose.yml
+
+# IDE
+.vscode/

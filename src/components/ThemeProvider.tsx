@@ -1,0 +1,54 @@
+'use client'
+
+import React, { createContext, useContext, useEffect, useState } from 'react'
+
+type Theme = 'light' | 'dark'
+
+interface ThemeContextType {
+    theme: Theme
+    toggleTheme: () => void
+}
+
+const ThemeContext = createContext<ThemeContextType | undefined>(undefined)
+
+function applyTheme(t: Theme) {
+    const root = document.documentElement
+    if (t === 'light') {
+        root.classList.add('light')
+        root.classList.remove('dark')
+        root.setAttribute('data-theme', 'light')
+    } else {
+        root.classList.add('dark')
+        root.classList.remove('light')
+        root.setAttribute('data-theme', 'dark')
+    }
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+    const [theme, setTheme] = useState<Theme>('dark')
+
+    useEffect(() => {
+        const saved = (localStorage.getItem('arc-theme') ?? 'dark') as Theme
+        setTheme(saved)
+        applyTheme(saved)
+    }, [])
+
+    const toggleTheme = () => {
+        const next: Theme = theme === 'dark' ? 'light' : 'dark'
+        setTheme(next)
+        localStorage.setItem('arc-theme', next)
+        applyTheme(next)
+    }
+
+    return (
+        <ThemeContext.Provider value={{ theme, toggleTheme }}>
+            {children}
+        </ThemeContext.Provider>
+    )
+}
+
+export function useTheme() {
+    const ctx = useContext(ThemeContext)
+    if (!ctx) throw new Error('useTheme must be used within ThemeProvider')
+    return ctx
+}

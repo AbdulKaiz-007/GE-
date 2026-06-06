@@ -1,0 +1,334 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { slugify } from '@/lib/game-engine'
+import { createHash } from 'crypto'
+
+import { createClient as createAdminClient, SupabaseClient } from '@supabase/supabase-js'
+
+// ─── AI PIPELINE ─────────────────────────────────────────────
+// Uses Google Gemini (free tier) for text generation
+// Uses Pollinations.ai (completely free, no key) for images
+
+// ─── AI PIPELINE ─────────────────────────────────────────────
+// Uses Groq (Llama 3 70B) for text generation
+// Uses Pollinations.ai (completely free, no key) for images
+
+const GROQ_API_KEY = process.env.Groq_API_KEY || process.env.GROQ_API_KEY
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+
+async function callAI(prompt: string, jsonMode: boolean = true): Promise<string> {
+    if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not found')
+
+    const res = await fetch(GROQ_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${GROQ_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: "llama3-70b-8192", // Fast and capable
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+            max_tokens: 4096,
+            response_format: jsonMode ? { type: "json_object" } : undefined
+        }),
+    })
+
+    if (!res.ok) {
+        const err = await res.text()
+        throw new Error(`Groq error (${res.status}): ${err}`)
+    }
+
+    const data = await res.json()
+    return data.choices?.[0]?.message?.content ?? ''
+}
+
+function generateImageUrl(prompt: string, seed: number): string {
+    const encoded = encodeURIComponent(prompt.slice(0, 200))
+    // flux model is great for anime/comic styles
+    return `https://image.pollinations.ai/prompt/${encoded}?width=512&height=512&seed=${seed}&nologo=true&model=flux`
+}
+
+// ─── AGENT 1: Concept Breakdown ──────────────────────────────
+async function conceptAgent(topic: string, difficulty: string): Promise<string[]> {
+    const prompt = `You are an educational concept breakdown expert.
+Break down the topic "${topic}" (${difficulty} level) into exactly 5 core concepts.
+Return ONLY a JSON object with a key "concepts" containing an array of strings.
+Example: { "concepts": ["Concept 1", "Concept 2", "Concept 3", "Concept 4", "Concept 5"] }`
+
+    const raw = await callAI(prompt, true)
+    try {
+        const parsed = JSON.parse(raw)
+        return parsed.concepts || parsed
+    } catch (e) {
+        console.error("JSON Parse Error (Concepts):", raw)
+        // Fallback
+        return [topic, `${topic} basics`, `${topic} mechanics`, `${topic} use cases`, `${topic} conclusion`]
+    }
+}
+
+// ─── AGENT 2+3: Story + Script ───────────────────────────────
+async function scriptAgent(topic: string, concepts: string[], difficulty: string): Promise<Array<{
+    panel_order: number; dialogue: string; narration: string; concept_tag: string; scene_desc: string
+}>> {
+    const prompt = `You are a comic book writer for an educational platform called Tutor Twin.
+Create a 8-panel comic script teaching "${topic}" (${difficulty} level).
+Concepts to cover: ${concepts.join(', ')}
+
+Characters:
+- Professor Arc: wise mentor, pirate captain style, long coat
+- Student Hero: young enthusiastic learner, bandana
+
+Return ONLY a valid JSON object with a key "panels" containing an array of 8 objects.
+Example structure:
+{
+  "panels": [
+    {
+      "panel_order": 1,
+      "dialogue": "Character dialogue here",
+      "narration": "Narrator caption here",
+      "concept_tag": "which concept this panel covers",
+      "scene_desc": "Visual scene description for image generation (comic style)"
+    }
+  ]
+}`
+    const raw = await callAI(prompt, true)
+    try {
+        const parsed = JSON.parse(raw)
+        return parsed.panels || parsed
+    } catch (e) {
+        throw new Error('Script generation failed to parse JSON')
+    }
+}
+
+// ─── AGENT 4: Question Generator ─────────────────────────────
+async function questionAgent(topic: string, concepts: string[]): Promise<Array<{
+    question_text: string; options: Array<{ label: string; text: string; is_correct: boolean }>;
+    correct_option: string; explanation: string; concept_tag: string; difficulty_tier: string
+}>> {
+    const prompt = `You are a quiz question generator for an educational game.
+Generate 9 multiple choice questions about "${topic}".
+Cover these concepts: ${concepts.join(', ')}
+- 3 questions: difficulty_tier "minion" (easy)
+- 3 questions: difficulty_tier "elite" (medium)  
+- 3 questions: difficulty_tier "boss" (hard)
+
+Return ONLY a valid JSON object with a key "questions" containing an array.
+Example structure:
+{
+  "questions": [
+    {
+      "question_text": "Question here?",
+      "options": [
+        {"label": "A", "text": "Option A", "is_correct": false},
+        {"label": "B", "text": "Option B", "is_correct": true},
+        {"label": "C", "text": "Option C", "is_correct": false},
+        {"label": "D", "text": "Option D", "is_correct": false}
+      ],
+      "correct_option": "B",
+      "explanation": "Brief explanation...",
+      "concept_tag": "related concept",
+      "difficulty_tier": "minion"
+    }
+  ]
+}`
+    const raw = await callAI(prompt, true)
+    try {
+        const parsed = JSON.parse(raw)
+        return parsed.questions || parsed
+    } catch (e) {
+        throw new Error('Question generation failed to parse JSON')
+    }
+}
+
+// ─── MAIN ROUTE ───────────────────────────────────────────────
+export async function POST(request: NextRequest) {
+    try {
+        const supabase = createClient()
+        const { data: { user } } = await supabase.auth.getUser()
+
+        // For guest mode, use service role client to bypass RLS
+        const adminClient = createAdminClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY!
+        )
+
+        // Use user client if logged in, otherwise use admin client (Guest Mode)
+        const dbClient = user ? supabase : adminClient
+
+        const body = await request.json()
+        const { topic, difficulty = 'beginner', subject_tag } = body
+
+        if (!topic || typeof topic !== 'string' || topic.length < 2) {
+            return NextResponse.json({ error: 'Invalid topic' }, { status: 400 })
+        }
+
+        // Check cache
+        const cacheKey = createHash('sha256').update(`${topic.toLowerCase()}${difficulty}`).digest('hex')
+        const { data: cached } = await dbClient
+            .from('lessons')
+            .select('id, topic')
+            .eq('cache_key', cacheKey)
+            .eq('is_published', true)
+            .single()
+
+        if (cached) {
+            return NextResponse.json({ lesson_id: cached.id, topic: cached.topic, cached: true })
+        }
+
+        if (!GROQ_API_KEY) {
+            // Demo mode: create a lesson with placeholder content
+            return await createDemoLesson(dbClient, topic, difficulty, subject_tag, cacheKey)
+        }
+
+        // Run AI pipeline
+        let concepts, panels, questions
+        try {
+            console.log('Calling Groq with key length:', GROQ_API_KEY?.length)
+            concepts = await conceptAgent(topic, difficulty)
+            panels = await scriptAgent(topic, concepts, difficulty)
+            questions = await questionAgent(topic, concepts)
+        } catch (aiError) {
+            console.error('AI Processing failed, falling back to demo:', aiError)
+            return await createDemoLesson(dbClient, topic, difficulty, subject_tag, cacheKey)
+        }
+
+        // Store lesson
+        const slug = slugify(topic)
+        const { data: lesson, error: lessonError } = await dbClient
+            .from('lessons')
+            .insert({
+                topic,
+                topic_slug: `${slug}-${Date.now()}`,
+                cache_key: cacheKey,
+                difficulty,
+                subject_tag: subject_tag || null,
+                panel_count: panels.length,
+                is_published: true,
+                story_arc: { concepts },
+            })
+            .select()
+            .single()
+
+        if (lessonError) throw lessonError
+
+        // Store panels with generated images
+        const panelInserts = panels.map((panel, i) => ({
+            lesson_id: lesson.id,
+            panel_order: panel.panel_order,
+            dialogue: panel.dialogue,
+            narration: panel.narration,
+            concept_tag: panel.concept_tag,
+            scene_desc: panel.scene_desc,
+            image_prompt: `manga comic panel, ${panel.scene_desc}, educational, vibrant colors, cel-shaded, clean lines`,
+            image_url: generateImageUrl(
+                `manga comic panel educational: ${panel.scene_desc}`,
+                i + Date.now()
+            ),
+        }))
+
+        await dbClient.from('comic_panels').insert(panelInserts)
+
+        // Store questions
+        const questionInserts = questions.map(q => ({
+            lesson_id: lesson.id,
+            question_text: q.question_text,
+            options: q.options,
+            correct_option: q.correct_option,
+            explanation: q.explanation,
+            concept_tag: q.concept_tag,
+            difficulty_tier: q.difficulty_tier,
+        }))
+
+        await dbClient.from('questions').insert(questionInserts)
+
+        return NextResponse.json({ lesson_id: lesson.id, topic: lesson.topic, cached: false })
+    } catch (err: unknown) {
+        console.error('Lesson generation error:', err)
+        // Check if it's already a response (from fallback)
+        if (err instanceof Response || (typeof err === 'object' && err && 'json' in err)) {
+            return err as NextResponse
+        }
+
+        return NextResponse.json(
+            { error: err instanceof Error ? err.message : 'Generation failed' },
+            { status: 500 }
+        )
+    }
+}
+
+// Demo mode when no API key is set or AI fails
+async function createDemoLesson(
+    supabase: SupabaseClient<any, "public", any>,
+    topic: string,
+    difficulty: string,
+    subject_tag: string | undefined,
+    cacheKey: string
+) {
+    try {
+        console.log(`Creating demo lesson for: ${topic}`)
+
+        const slug = slugify(topic)
+        // 1. Create Lesson
+        const { data: lesson, error: lessonError } = await supabase
+            .from('lessons')
+            .insert({
+                topic,
+                topic_slug: `${slug}-${Date.now()}`,
+                cache_key: cacheKey,
+                difficulty,
+                subject_tag: subject_tag || null,
+                panel_count: 4,
+                is_published: true,
+                story_arc: { concepts: [`Introduction to ${topic}`, `Core principles`, `Applications`, `Summary`] },
+            })
+            .select()
+            .single()
+
+        if (lessonError) {
+            console.error('Demo lesson insert failed:', lessonError)
+            throw lessonError
+        }
+
+        // 2. Create Panels
+        const demoPanels = [
+            { panel_order: 1, dialogue: `"Welcome to the map of ${topic}!"`, narration: `Professor Arc opens an ancient scroll.`, concept_tag: 'Introduction', scene_desc: `Professor Arc holding a weathered map that says "${topic}" in a captain's cabin` },
+            { panel_order: 2, dialogue: `"These are the hidden treasures!"`, narration: `The journey begins.`, concept_tag: 'Core Concepts', scene_desc: `Student Hero discovering glowing runes on a sandy beach` },
+            { panel_order: 3, dialogue: `"X marks the spot for real world use!"`, narration: `Applications revealed.`, concept_tag: 'Applications', scene_desc: `Professor Arc and Student Hero digging up a chest of knowledge` },
+            { panel_order: 4, dialogue: `"Ready to face the Kraken?"`, narration: `The lesson concludes.`, concept_tag: 'Summary', scene_desc: `Student Hero drawing a sword, ready to fight a sea monster` },
+        ]
+
+        const { error: panelError } = await supabase.from('comic_panels').insert(
+            demoPanels.map(p => ({
+                ...p,
+                lesson_id: lesson.id,
+                image_url: generateImageUrl(`pirate adventure map style: ${p.scene_desc}`, p.panel_order),
+                image_prompt: p.scene_desc,
+            }))
+        )
+        if (panelError) {
+            console.error('Demo panel insert failed:', panelError)
+            // Don't throw, just log. The lesson exists.
+        }
+
+        // 3. Create Questions
+        const demoQuestions = [
+            { question_text: `What is the treasure map leading to in ${topic}?`, options: [{ label: 'A', text: `The core meaning of ${topic}`, is_correct: true }, { label: 'B', text: 'Fool\'s Gold', is_correct: false }, { label: 'C', text: 'Empty sand', is_correct: false }, { label: 'D', text: 'A trap', is_correct: false }], correct_option: 'A', explanation: `${topic} is the true treasure.`, concept_tag: 'Introduction', difficulty_tier: 'minion' },
+            { question_text: `Which key unlocks the ${topic} chest?`, options: [{ label: 'A', text: 'Ignorance', is_correct: false }, { label: 'B', text: 'Theory only', is_correct: false }, { label: 'C', text: 'Theory and Practice', is_correct: true }, { label: 'D', text: 'Luck', is_correct: false }], correct_option: 'C', explanation: `You need both theory and practice to master ${topic}.`, concept_tag: 'Core Concepts', difficulty_tier: 'elite' },
+            { question_text: `The Captain asks: Why is ${topic} dangerous?`, options: [{ label: 'A', text: 'It requires deep thinking', is_correct: true }, { label: 'B', text: 'It is easy', is_correct: false }, { label: 'C', text: 'It is boring', is_correct: false }, { label: 'D', text: 'It is fake', is_correct: false }], correct_option: 'A', explanation: `${topic} challenges your mind like a storm at sea.`, concept_tag: 'Applications', difficulty_tier: 'boss' },
+        ]
+
+        const { error: questionError } = await supabase.from('questions').insert(
+            demoQuestions.map(q => ({ ...q, lesson_id: lesson.id }))
+        )
+        if (questionError) console.error('Demo question insert failed:', questionError)
+
+        return NextResponse.json({ lesson_id: lesson.id, topic: lesson.topic, cached: false, demo: true })
+    } catch (error) {
+        console.error('Critical error in createDemoLesson:', error)
+        return NextResponse.json(
+            { error: 'Demo generation failed', details: error instanceof Error ? error.message : 'Unknown' },
+            { status: 500 }
+        )
+    }
+}

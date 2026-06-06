@@ -1,0 +1,51 @@
+import { createClient } from '@/lib/supabase/server'
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+
+export const dynamic = 'force-dynamic'
+
+export async function GET(request: NextRequest) {
+    const requestUrl = new URL(request.url)
+    const code = requestUrl.searchParams.get('code')
+    const next = requestUrl.searchParams.get('next') ?? '/dashboard'
+
+    if (code) {
+        const supabase = await createClient()
+        const { error } = await supabase.auth.exchangeCodeForSession(code)
+
+        if (error) {
+            console.error('Auth Callback Error:', error)
+        }
+
+        if (!error) {
+            // Ensure the profile row exists (trigger handles it, but just in case)
+            const { data: { user } } = await supabase.auth.getUser()
+            if (user) {
+                const { data: existing } = await supabase
+                    .from('profiles')
+                    .select('id')
+                    .eq('id', user.id)
+                    .single()
+
+                if (!existing) {
+                    await supabase.from('profiles').insert({
+                        id: user.id,
+                        username: user.user_metadata?.user_name ?? user.email?.split('@')[0] ?? 'warrior',
+                        avatar_url: user.user_metadata?.avatar_url ?? null,
+                    })
+                }
+            }
+
+            return NextResponse.redirect(new URL(next, requestUrl.origin))
+        }
+    }
+
+    // Auth failed — redirect to login with error
+    if (code && !requestUrl.searchParams.get('error')) {
+        // Only log if we attempted an exchange and it failed, not if the provider sent an error param directly
+        // But wait, if exchangeCodeForSession failed, 'error' in log above would have caught it.
+        // Let's just return the redirects.
+    }
+
+    return NextResponse.redirect(new URL(`/login?error=auth_failed&details=${encodeURIComponent('Check terminal for logs')}`, requestUrl.origin))
+}
